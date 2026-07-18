@@ -28,7 +28,11 @@ num_ciclos = st.sidebar.slider(
          "'corridos' en vez de nítidos.",
 )
 fs = st.sidebar.select_slider("Frecuencia de muestreo (Hz)", options=[2000, 5000, 10000, 20000, 50000], value=10000, key="fs")
-num_armonicos = st.sidebar.slider("Cantidad de armónicos", 1, 20, 3, key="num_arm")
+num_armonicos = st.sidebar.number_input(
+    "Cantidad de armónicos", min_value=1, max_value=200, value=3, step=1, key="num_arm",
+    help="Sin límite práctico — para números grandes la edición se hace más cómoda "
+         "en la tabla de abajo que con un slider.",
+)
 
 t_max = num_ciclos / f_base
 
@@ -40,24 +44,37 @@ preset = st.sidebar.selectbox(
 )
 
 
-def _aplicar_preset():
-    p = st.session_state["preset_select"]
-    n_arm = st.session_state["num_arm"]
+def _armonicos_default(p: str, n_arm: int):
+    """Devuelve (mods, fases_deg) para un preset dado, sin tocar session_state."""
     if p == "Solo fundamental":
         mods = [1.0] + [0.0] * (n_arm - 1)
-        fases = [0.0] * n_arm
     elif p == "Rectificador (impares, decreciente)":
         mods = [(1.0 / (i + 1)) if (i + 1) % 2 == 1 else 0.0 for i in range(n_arm)]
-        fases = [0.0] * n_arm
     elif p == "Distorsión típica motor VFD":
         base = {1: 1.0, 5: 0.25, 7: 0.15, 11: 0.08, 13: 0.06}
         mods = [base.get(i + 1, 0.0) for i in range(n_arm)]
-        fases = [0.0] * n_arm
-    else:
-        return  # "Personalizado": no toca nada, deja los valores actuales
-    for i in range(n_arm):
-        st.session_state[f"mod_{i+1}"] = mods[i]
-        st.session_state[f"fase_{i+1}"] = fases[i]
+    else:  # Personalizado / fallback
+        mods = [1.0 if i == 0 else 0.0 for i in range(n_arm)]
+    fases = [0.0] * n_arm
+    return mods, fases
+
+
+def _aplicar_preset():
+    p = st.session_state["preset_select"]
+    n_arm = st.session_state["num_arm"]
+    if p == "Personalizado":
+        return  # no toca nada, deja los valores actuales
+    mods, fases_deg = _armonicos_default(p, n_arm)
+    st.session_state["harm_df"] = pd.DataFrame({
+        "Armónico": list(range(1, n_arm + 1)),
+        "Frecuencia (Hz)": [n * st.session_state["f_base"] for n in range(1, n_arm + 1)],
+        "Módulo": mods,
+        "Fase (°)": fases_deg,
+    })
+    # Descarta cualquier edición manual pendiente en la tabla para que
+    # tome los valores del preset sin que el widget la pise de vuelta
+    # (mismo problema que ya resolvimos con los sliders de la app de fasores).
+    st.session_state.pop("harm_editor", None)
 
 
 st.sidebar.button("✅ Aplicar preset", on_click=_aplicar_preset, use_container_width=True)
@@ -74,22 +91,62 @@ if f_max_pedido >= fs / 2:
 t = np.linspace(0, t_max, int(fs * t_max), endpoint=False)
 
 # ------------------------------------------------------------------
-# Configuración de armónicos
+# Configuración de armónicos — tabla editable
 # ------------------------------------------------------------------
 st.subheader("Configuración de armónicos")
+st.caption("Editá Módulo y Fase directamente en la tabla. Frecuencia se recalcula sola.")
 
-modulos, fases = [], []
-n_cols = 4
-cols = st.columns(n_cols)
-for n in range(1, num_armonicos + 1):
-    col = cols[(n - 1) % n_cols]
-    with col:
-        st.markdown(f"**Armónico {n}** ({n * f_base} Hz)")
-        default_mod = 1.0 if n == 1 else 0.0
-        modulo = st.number_input("Módulo", value=default_mod, step=0.05, key=f"mod_{n}", min_value=0.0)
-        fase = st.number_input("Fase (°)", value=0.0, step=5.0, key=f"fase_{n}")
-    modulos.append(modulo)
-    fases.append(np.deg2rad(fase))
+frecuencias_actuales = [n * f_base for n in range(1, num_armonicos + 1)]
+
+if "harm_df" not in st.session_state:
+    mods0, fases0 = _armonicos_default("Personalizado", num_armonicos)
+    st.session_state["harm_df"] = pd.DataFrame({
+        "Armónico": list(range(1, num_armonicos + 1)),
+        "Frecuencia (Hz)": frecuencias_actuales,
+        "Módulo": mods0,
+        "Fase (°)": fases0,
+    })
+else:
+    # Ajustar cantidad de filas si cambió num_armonicos, preservando lo ya cargado
+    base_df = st.session_state["harm_df"]
+    n_actual = len(base_df)
+    if n_actual != num_armonicos:
+        if num_armonicos > n_actual:
+            extra_mods, extra_fases = _armonicos_default("Personalizado", num_armonicos - n_actual)
+            extra = pd.DataFrame({
+                "Armónico": list(range(n_actual + 1, num_armonicos + 1)),
+                "Frecuencia (Hz)": [n * f_base for n in range(n_actual + 1, num_armonicos + 1)],
+                "Módulo": [0.0] * (num_armonicos - n_actual),
+                "Fase (°)": [0.0] * (num_armonicos - n_actual),
+            })
+            base_df = pd.concat([base_df, extra], ignore_index=True)
+        else:
+            base_df = base_df.iloc[:num_armonicos].reset_index(drop=True)
+        base_df["Frecuencia (Hz)"] = frecuencias_actuales
+        st.session_state["harm_df"] = base_df
+        st.session_state.pop("harm_editor", None)
+    else:
+        # misma cantidad de filas: sólo refrescar frecuencia por si cambió f_base
+        base_df["Frecuencia (Hz)"] = frecuencias_actuales
+        st.session_state["harm_df"] = base_df
+
+edited_df = st.data_editor(
+    st.session_state["harm_df"],
+    key="harm_editor",
+    use_container_width=True,
+    hide_index=True,
+    height=min(38 * (num_armonicos + 1) + 3, 480),
+    column_config={
+        "Armónico": st.column_config.NumberColumn(disabled=True),
+        "Frecuencia (Hz)": st.column_config.NumberColumn(disabled=True, format="%d"),
+        "Módulo": st.column_config.NumberColumn(min_value=0.0, step=0.05, format="%.3f"),
+        "Fase (°)": st.column_config.NumberColumn(step=5.0, format="%.1f"),
+    },
+)
+st.session_state["harm_df"] = edited_df
+
+modulos = edited_df["Módulo"].tolist()
+fases = np.deg2rad(edited_df["Fase (°)"].to_numpy()).tolist()
 
 # ------------------------------------------------------------------
 # Construcción de señales
@@ -179,20 +236,16 @@ else:
     st.info("Ajustá los parámetros para generar la señal.")
 
 # ------------------------------------------------------------------
-# Tabla resumen + exportación
+# Resumen (% del fundamental) + exportación
 # ------------------------------------------------------------------
-st.subheader("🧮 Resumen de armónicos")
+st.subheader("🧮 Resumen — % respecto del fundamental")
 
-df = pd.DataFrame({
-    "Armónico": list(range(1, num_armonicos + 1)),
-    "Frecuencia (Hz)": frecuencias,
-    "Módulo": modulos,
-    "Fase (°)": [np.rad2deg(f) for f in fases],
-    "% del fundamental": [
-        (m / modulos[0] * 100) if modulos[0] > 1e-9 else 0.0 for m in modulos
-    ],
-})
-st.dataframe(df, use_container_width=True, hide_index=True)
+df = edited_df.copy()
+df["% del fundamental"] = (
+    df["Módulo"] / df["Módulo"].iloc[0] * 100 if df["Módulo"].iloc[0] > 1e-9 else 0.0
+)
+st.dataframe(df, use_container_width=True, hide_index=True,
+             height=min(38 * (num_armonicos + 1) + 3, 320))
 
 col_dl1, col_dl2 = st.columns(2)
 col_dl1.download_button(
@@ -233,146 +286,153 @@ st.caption(
     "cola, la punta del último traza exactamente la señal compuesta a la derecha."
 )
 
-armonicos_json = [
-    {"n": n, "mod": modulos[n - 1], "fase": float(fases[n - 1])}
-    for n in range(1, num_armonicos + 1)
-]
-colores_json = [colores[i % len(colores)] for i in range(num_armonicos)]
+if num_armonicos > 60:
+    st.info(
+        f"Con {num_armonicos} armónicos el diagrama de epiciclos se vuelve ilegible y "
+        "pesado para el navegador — esta visualización se muestra hasta 60 armónicos. "
+        "El resto de los cálculos (señal, FFT, THD) no tiene este límite."
+    )
+else:
+    armonicos_json = [
+        {"n": n, "mod": modulos[n - 1], "fase": float(fases[n - 1])}
+        for n in range(1, num_armonicos + 1)
+    ]
+    colores_json = [colores[i % len(colores)] for i in range(num_armonicos)]
 
-EPI_PARAMS = dict(fBase=f_base, armonicos=armonicos_json, colores=colores_json)
+    EPI_PARAMS = dict(fBase=f_base, armonicos=armonicos_json, colores=colores_json)
 
-EPI_HTML = r"""
-<div style="font-family:'Source Sans Pro',sans-serif; color:#fafafa;">
-  <div style="display:flex; gap:16px; flex-wrap:wrap;">
-    <div id="epi" style="flex:1; min-width:320px; height:380px;"></div>
-    <div id="ondaAnim" style="flex:1.3; min-width:380px; height:380px;"></div>
-  </div>
-  <div style="margin:8px 0; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-    <button id="epiPlay" style="background:#2b2f38; color:#fafafa; border:1px solid #555; border-radius:6px; padding:6px 16px; cursor:pointer; font-size:14px;">▶ Animar</button>
-    <label style="font-size:13px; color:#bbb; display:flex; align-items:center; gap:6px;">
-      Velocidad
-      <input id="epiSpeed" type="range" min="0.02" max="1" step="0.02" value="0.15" style="width:100px;">
-      <span id="epiSpeedLabel">0.15×</span>
-    </label>
-  </div>
-</div>
+    EPI_HTML = r"""
+    <div style="font-family:'Source Sans Pro',sans-serif; color:#fafafa;">
+      <div style="display:flex; gap:16px; flex-wrap:wrap;">
+        <div id="epi" style="flex:1; min-width:320px; height:380px;"></div>
+        <div id="ondaAnim" style="flex:1.3; min-width:380px; height:380px;"></div>
+      </div>
+      <div style="margin:8px 0; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <button id="epiPlay" style="background:#2b2f38; color:#fafafa; border:1px solid #555; border-radius:6px; padding:6px 16px; cursor:pointer; font-size:14px;">▶ Animar</button>
+        <label style="font-size:13px; color:#bbb; display:flex; align-items:center; gap:6px;">
+          Velocidad
+          <input id="epiSpeed" type="range" min="0.02" max="1" step="0.02" value="0.15" style="width:100px;">
+          <span id="epiSpeedLabel">0.15×</span>
+        </label>
+      </div>
+    </div>
 
-<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
-<script>
-const EP = __EPI_PARAMS__;
-const OMEGA_BASE = 2 * Math.PI * EP.fBase;
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+    <script>
+    const EP = __EPI_PARAMS__;
+    const OMEGA_BASE = 2 * Math.PI * EP.fBase;
 
-function cAdd(a,b){ return {re:a.re+b.re, im:a.im+b.im}; }
-function cAbs(a){ return Math.hypot(a.re,a.im); }
+    function cAdd(a,b){ return {re:a.re+b.re, im:a.im+b.im}; }
+    function cAbs(a){ return Math.hypot(a.re,a.im); }
 
-function fasorArm(h, tSec) {
-  const angRad = h.fase + OMEGA_BASE * h.n * tSec;
-  return {re: h.mod*Math.cos(angRad), im: h.mod*Math.sin(angRad)};
-}
+    function fasorArm(h, tSec) {
+      const angRad = h.fase + OMEGA_BASE * h.n * tSec;
+      return {re: h.mod*Math.cos(angRad), im: h.mod*Math.sin(angRad)};
+    }
 
-// --- onda estática de referencia (2 períodos de la fundamental) ---
-const T_PERIOD_MS = (1/EP.fBase) * 1000;
-const T_ARRAY = [];
-for (let i=0; i<600; i++) T_ARRAY.push(i * (2*T_PERIOD_MS) / 599);
+    // --- onda estática de referencia (2 períodos de la fundamental) ---
+    const T_PERIOD_MS = (1/EP.fBase) * 1000;
+    const T_ARRAY = [];
+    for (let i=0; i<600; i++) T_ARRAY.push(i * (2*T_PERIOD_MS) / 599);
 
-function ondaEnT(tMs) {
-  const t = tMs/1000;
-  let y = 0;
-  EP.armonicos.forEach(h => { y += h.mod * Math.sin(OMEGA_BASE*h.n*t + h.fase); });
-  return y;
-}
-const ONDA_Y = T_ARRAY.map(ondaEnT);
-const yMax = Math.max(...ONDA_Y.map(Math.abs), 1) * 1.25;
+    function ondaEnT(tMs) {
+      const t = tMs/1000;
+      let y = 0;
+      EP.armonicos.forEach(h => { y += h.mod * Math.sin(OMEGA_BASE*h.n*t + h.fase); });
+      return y;
+    }
+    const ONDA_Y = T_ARRAY.map(ondaEnT);
+    const yMax = Math.max(...ONDA_Y.map(Math.abs), 1) * 1.25;
 
-const modSum = EP.armonicos.reduce((s,h)=>s+h.mod, 0) || 1;
-const limEpi = modSum * 1.15;
+    const modSum = EP.armonicos.reduce((s,h)=>s+h.mod, 0) || 1;
+    const limEpi = modSum * 1.15;
 
-const BASE_LAYOUT = {
-  paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
-  font:{color:'#eee'}, margin:{l:40,r:20,t:36,b:36}, showlegend:false,
-};
-const AX = {zeroline:false, showgrid:true, gridcolor:'rgba(128,128,128,0.25)', color:'#bbb'};
+    const BASE_LAYOUT = {
+      paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
+      font:{color:'#eee'}, margin:{l:40,r:20,t:36,b:36}, showlegend:false,
+    };
+    const AX = {zeroline:false, showgrid:true, gridcolor:'rgba(128,128,128,0.25)', color:'#bbb'};
 
-let initialized = false;
+    let initialized = false;
 
-function chainTraces(tSec) {
-  let p = {re:0, im:0};
-  const xs=[0], ys=[0];
-  EP.armonicos.forEach(h => {
-    const V = fasorArm(h, tSec);
-    p = cAdd(p, V);
-    xs.push(p.re); ys.push(p.im);
-  });
-  return {xs, ys, tip: p};
-}
+    function chainTraces(tSec) {
+      let p = {re:0, im:0};
+      const xs=[0], ys=[0];
+      EP.armonicos.forEach(h => {
+        const V = fasorArm(h, tSec);
+        p = cAdd(p, V);
+        xs.push(p.re); ys.push(p.im);
+      });
+      return {xs, ys, tip: p};
+    }
 
-function render(tMs) {
-  const tSec = tMs/1000;
-  const {xs, ys, tip} = chainTraces(tSec);
+    function render(tMs) {
+      const tSec = tMs/1000;
+      const {xs, ys, tip} = chainTraces(tSec);
 
-  const epiTraces = [{
-    x: xs, y: ys, mode:'lines+markers',
-    line:{color:'rgba(200,200,200,0.5)', width:1.5},
-    marker:{size:5, color: ['#888'].concat(EP.colores)},
-  }];
-  const epiLayout = Object.assign({}, BASE_LAYOUT, {
-    title:{text:'Suma vectorial (epiciclos)', font:{size:13}},
-    xaxis: Object.assign({}, AX, {range:[-limEpi, limEpi]}),
-    yaxis: Object.assign({}, AX, {range:[-limEpi, limEpi], scaleanchor:'x', scaleratio:1}),
-  });
+      const epiTraces = [{
+        x: xs, y: ys, mode:'lines+markers',
+        line:{color:'rgba(200,200,200,0.5)', width:1.5},
+        marker:{size:5, color: ['#888'].concat(EP.colores)},
+      }];
+      const epiLayout = Object.assign({}, BASE_LAYOUT, {
+        title:{text:'Suma vectorial (epiciclos)', font:{size:13}},
+        xaxis: Object.assign({}, AX, {range:[-limEpi, limEpi]}),
+        yaxis: Object.assign({}, AX, {range:[-limEpi, limEpi], scaleanchor:'x', scaleratio:1}),
+      });
 
-  const ondaLayout = Object.assign({}, BASE_LAYOUT, {
-    title:{text:'Señal compuesta', font:{size:13}},
-    xaxis: Object.assign({}, AX, {title:'Tiempo (ms)'}),
-    yaxis: Object.assign({}, AX, {range:[-yMax, yMax]}),
-    shapes:[{type:'line', x0:tMs, x1:tMs, y0:-yMax, y1:yMax,
-             line:{color:'rgba(255,255,255,0.4)', width:1, dash:'dash'}}],
-  });
+      const ondaLayout = Object.assign({}, BASE_LAYOUT, {
+        title:{text:'Señal compuesta', font:{size:13}},
+        xaxis: Object.assign({}, AX, {title:'Tiempo (ms)'}),
+        yaxis: Object.assign({}, AX, {range:[-yMax, yMax]}),
+        shapes:[{type:'line', x0:tMs, x1:tMs, y0:-yMax, y1:yMax,
+                 line:{color:'rgba(255,255,255,0.4)', width:1, dash:'dash'}}],
+      });
 
-  const config = {displaylogo:false, responsive:true};
+      const config = {displaylogo:false, responsive:true};
 
-  if (!initialized) {
-    Plotly.newPlot('epi', epiTraces, epiLayout, config);
-    Plotly.newPlot('ondaAnim', [
-      {x:T_ARRAY, y:ONDA_Y, mode:'lines', line:{color:'#eee', width:2}},
-      {x:[tMs], y:[tip.im], mode:'markers', marker:{size:9, color:'#fff'}},
-    ], ondaLayout, config);
-    initialized = true;
-  } else {
-    Plotly.react('epi', epiTraces, epiLayout, config);
-    Plotly.relayout('ondaAnim', {shapes: ondaLayout.shapes});
-    Plotly.restyle('ondaAnim', {x:[[tMs]], y:[[tip.im]]}, [1]);
-  }
-}
+      if (!initialized) {
+        Plotly.newPlot('epi', epiTraces, epiLayout, config);
+        Plotly.newPlot('ondaAnim', [
+          {x:T_ARRAY, y:ONDA_Y, mode:'lines', line:{color:'#eee', width:2}},
+          {x:[tMs], y:[tip.im], mode:'markers', marker:{size:9, color:'#fff'}},
+        ], ondaLayout, config);
+        initialized = true;
+      } else {
+        Plotly.react('epi', epiTraces, epiLayout, config);
+        Plotly.relayout('ondaAnim', {shapes: ondaLayout.shapes});
+        Plotly.restyle('ondaAnim', {x:[[tMs]], y:[[tip.im]]}, [1]);
+      }
+    }
 
-let animando=false, lastT=null, tMs=0, velocidad=0.15*0.05;
-const playBtn = document.getElementById('epiPlay');
-const speedSlider = document.getElementById('epiSpeed');
-const speedLabel = document.getElementById('epiSpeedLabel');
-const CICLO_MS = 2 * T_PERIOD_MS;
+    let animando=false, lastT=null, tMs=0, velocidad=0.15*0.05;
+    const playBtn = document.getElementById('epiPlay');
+    const speedSlider = document.getElementById('epiSpeed');
+    const speedLabel = document.getElementById('epiSpeedLabel');
+    const CICLO_MS = 2 * T_PERIOD_MS;
 
-function frame(now) {
-  if (!animando) return;
-  if (lastT===null) lastT = now;
-  const dt = now - lastT; lastT = now;
-  tMs = (tMs + dt*velocidad) % CICLO_MS;
-  render(tMs);
-  requestAnimationFrame(frame);
-}
-playBtn.addEventListener('click', () => {
-  animando = !animando;
-  playBtn.textContent = animando ? '⏸ Pausar' : '▶ Animar';
-  if (animando) { lastT=null; requestAnimationFrame(frame); }
-});
-speedSlider.addEventListener('input', () => {
-  const v = parseFloat(speedSlider.value);
-  velocidad = v*0.05;
-  speedLabel.textContent = v.toFixed(2) + '×';
-});
+    function frame(now) {
+      if (!animando) return;
+      if (lastT===null) lastT = now;
+      const dt = now - lastT; lastT = now;
+      tMs = (tMs + dt*velocidad) % CICLO_MS;
+      render(tMs);
+      requestAnimationFrame(frame);
+    }
+    playBtn.addEventListener('click', () => {
+      animando = !animando;
+      playBtn.textContent = animando ? '⏸ Pausar' : '▶ Animar';
+      if (animando) { lastT=null; requestAnimationFrame(frame); }
+    });
+    speedSlider.addEventListener('input', () => {
+      const v = parseFloat(speedSlider.value);
+      velocidad = v*0.05;
+      speedLabel.textContent = v.toFixed(2) + '×';
+    });
 
-render(0);
-</script>
-"""
+    render(0);
+    </script>
+    """
 
-epi_html_final = EPI_HTML.replace("__EPI_PARAMS__", json.dumps(EPI_PARAMS))
-components.html(epi_html_final, height=480, scrolling=False)
+    epi_html_final = EPI_HTML.replace("__EPI_PARAMS__", json.dumps(EPI_PARAMS))
+    components.html(epi_html_final, height=480, scrolling=False)
