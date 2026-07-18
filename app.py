@@ -1,7 +1,9 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import json
 
 st.set_page_config(page_title="Análisis de Armónicos", page_icon="🌊", layout="wide")
 
@@ -215,3 +217,162 @@ with st.expander("ℹ️ ¿Cómo se calcula el THD?"):
         "armónico superior. Un THD alto indica una señal muy distorsionada respecto "
         "de una onda senoidal pura."
     )
+
+# ------------------------------------------------------------------
+# Síntesis animada (epiciclos de Fourier)
+# ------------------------------------------------------------------
+# Misma técnica que la app de componentes simétricas: componente HTML
+# embebido con Plotly.js corriendo 100% en el navegador, animado con
+# requestAnimationFrame. Cada armónico es un fasor que gira a su propia
+# velocidad (n·f_base) y se van encadenando punta-con-cola; la punta del
+# último vector traza exactamente la señal compuesta en el tiempo — es
+# la construcción geométrica clásica de una serie de Fourier.
+st.subheader("🌀 Síntesis animada (epiciclos de Fourier)")
+st.caption(
+    "Cada armónico es un vector que gira a su propia velocidad. Encadenados punta con "
+    "cola, la punta del último traza exactamente la señal compuesta a la derecha."
+)
+
+armonicos_json = [
+    {"n": n, "mod": modulos[n - 1], "fase": float(fases[n - 1])}
+    for n in range(1, num_armonicos + 1)
+]
+colores_json = [colores[i % len(colores)] for i in range(num_armonicos)]
+
+EPI_PARAMS = dict(fBase=f_base, armonicos=armonicos_json, colores=colores_json)
+
+EPI_HTML = r"""
+<div style="font-family:'Source Sans Pro',sans-serif; color:#fafafa;">
+  <div style="display:flex; gap:16px; flex-wrap:wrap;">
+    <div id="epi" style="flex:1; min-width:320px; height:380px;"></div>
+    <div id="ondaAnim" style="flex:1.3; min-width:380px; height:380px;"></div>
+  </div>
+  <div style="margin:8px 0; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+    <button id="epiPlay" style="background:#2b2f38; color:#fafafa; border:1px solid #555; border-radius:6px; padding:6px 16px; cursor:pointer; font-size:14px;">▶ Animar</button>
+    <label style="font-size:13px; color:#bbb; display:flex; align-items:center; gap:6px;">
+      Velocidad
+      <input id="epiSpeed" type="range" min="0.02" max="1" step="0.02" value="0.15" style="width:100px;">
+      <span id="epiSpeedLabel">0.15×</span>
+    </label>
+  </div>
+</div>
+
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<script>
+const EP = __EPI_PARAMS__;
+const OMEGA_BASE = 2 * Math.PI * EP.fBase;
+
+function cAdd(a,b){ return {re:a.re+b.re, im:a.im+b.im}; }
+function cAbs(a){ return Math.hypot(a.re,a.im); }
+
+function fasorArm(h, tSec) {
+  const angRad = h.fase + OMEGA_BASE * h.n * tSec;
+  return {re: h.mod*Math.cos(angRad), im: h.mod*Math.sin(angRad)};
+}
+
+// --- onda estática de referencia (2 períodos de la fundamental) ---
+const T_PERIOD_MS = (1/EP.fBase) * 1000;
+const T_ARRAY = [];
+for (let i=0; i<600; i++) T_ARRAY.push(i * (2*T_PERIOD_MS) / 599);
+
+function ondaEnT(tMs) {
+  const t = tMs/1000;
+  let y = 0;
+  EP.armonicos.forEach(h => { y += h.mod * Math.sin(OMEGA_BASE*h.n*t + h.fase); });
+  return y;
+}
+const ONDA_Y = T_ARRAY.map(ondaEnT);
+const yMax = Math.max(...ONDA_Y.map(Math.abs), 1) * 1.25;
+
+const modSum = EP.armonicos.reduce((s,h)=>s+h.mod, 0) || 1;
+const limEpi = modSum * 1.15;
+
+const BASE_LAYOUT = {
+  paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
+  font:{color:'#eee'}, margin:{l:40,r:20,t:36,b:36}, showlegend:false,
+};
+const AX = {zeroline:false, showgrid:true, gridcolor:'rgba(128,128,128,0.25)', color:'#bbb'};
+
+let initialized = false;
+
+function chainTraces(tSec) {
+  let p = {re:0, im:0};
+  const xs=[0], ys=[0];
+  EP.armonicos.forEach(h => {
+    const V = fasorArm(h, tSec);
+    p = cAdd(p, V);
+    xs.push(p.re); ys.push(p.im);
+  });
+  return {xs, ys, tip: p};
+}
+
+function render(tMs) {
+  const tSec = tMs/1000;
+  const {xs, ys, tip} = chainTraces(tSec);
+
+  const epiTraces = [{
+    x: xs, y: ys, mode:'lines+markers',
+    line:{color:'rgba(200,200,200,0.5)', width:1.5},
+    marker:{size:5, color: ['#888'].concat(EP.colores)},
+  }];
+  const epiLayout = Object.assign({}, BASE_LAYOUT, {
+    title:{text:'Suma vectorial (epiciclos)', font:{size:13}},
+    xaxis: Object.assign({}, AX, {range:[-limEpi, limEpi]}),
+    yaxis: Object.assign({}, AX, {range:[-limEpi, limEpi], scaleanchor:'x', scaleratio:1}),
+  });
+
+  const ondaLayout = Object.assign({}, BASE_LAYOUT, {
+    title:{text:'Señal compuesta', font:{size:13}},
+    xaxis: Object.assign({}, AX, {title:'Tiempo (ms)'}),
+    yaxis: Object.assign({}, AX, {range:[-yMax, yMax]}),
+    shapes:[{type:'line', x0:tMs, x1:tMs, y0:-yMax, y1:yMax,
+             line:{color:'rgba(255,255,255,0.4)', width:1, dash:'dash'}}],
+  });
+
+  const config = {displaylogo:false, responsive:true};
+
+  if (!initialized) {
+    Plotly.newPlot('epi', epiTraces, epiLayout, config);
+    Plotly.newPlot('ondaAnim', [
+      {x:T_ARRAY, y:ONDA_Y, mode:'lines', line:{color:'#eee', width:2}},
+      {x:[tMs], y:[tip.im], mode:'markers', marker:{size:9, color:'#fff'}},
+    ], ondaLayout, config);
+    initialized = true;
+  } else {
+    Plotly.react('epi', epiTraces, epiLayout, config);
+    Plotly.relayout('ondaAnim', {shapes: ondaLayout.shapes});
+    Plotly.restyle('ondaAnim', {x:[[tMs]], y:[[tip.im]]}, [1]);
+  }
+}
+
+let animando=false, lastT=null, tMs=0, velocidad=0.15*0.05;
+const playBtn = document.getElementById('epiPlay');
+const speedSlider = document.getElementById('epiSpeed');
+const speedLabel = document.getElementById('epiSpeedLabel');
+const CICLO_MS = 2 * T_PERIOD_MS;
+
+function frame(now) {
+  if (!animando) return;
+  if (lastT===null) lastT = now;
+  const dt = now - lastT; lastT = now;
+  tMs = (tMs + dt*velocidad) % CICLO_MS;
+  render(tMs);
+  requestAnimationFrame(frame);
+}
+playBtn.addEventListener('click', () => {
+  animando = !animando;
+  playBtn.textContent = animando ? '⏸ Pausar' : '▶ Animar';
+  if (animando) { lastT=null; requestAnimationFrame(frame); }
+});
+speedSlider.addEventListener('input', () => {
+  const v = parseFloat(speedSlider.value);
+  velocidad = v*0.05;
+  speedLabel.textContent = v.toFixed(2) + '×';
+});
+
+render(0);
+</script>
+"""
+
+epi_html_final = EPI_HTML.replace("__EPI_PARAMS__", json.dumps(EPI_PARAMS))
+components.html(epi_html_final, height=480, scrolling=False)
