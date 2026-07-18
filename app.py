@@ -2,7 +2,6 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Análisis de Armónicos", page_icon="🌊", layout="wide")
 
@@ -17,40 +16,60 @@ st.caption(
 # ------------------------------------------------------------------
 st.sidebar.title("⚙️ Parámetros del sistema")
 
-f_base = st.sidebar.slider("Frecuencia del sistema (Hz)", 10, 100, 50, step=1)
-t_max = st.sidebar.slider("Duración de la señal (s)", 0.01, 1.0, 0.1, step=0.01)
-fs = st.sidebar.select_slider("Frecuencia de muestreo (Hz)", options=[2000, 5000, 10000, 20000, 50000], value=10000)
-num_armonicos = st.sidebar.slider("Cantidad de armónicos", 1, 20, 3)
+f_base = st.sidebar.slider("Frecuencia del sistema (Hz)", 10, 100, 50, step=1, key="f_base")
+num_ciclos = st.sidebar.slider(
+    "Duración — ciclos de la fundamental", 1, 20, 5, step=1, key="num_ciclos",
+    help="Se expresa en ciclos enteros (no en segundos) para que la señal analizada "
+         "sea siempre un número exacto de períodos. Esto evita la fuga espectral "
+         "(spectral leakage) en la FFT: con una duración arbitraria en segundos, si no "
+         "coincide con un múltiplo exacto del período, los picos del espectro salen "
+         "'corridos' en vez de nítidos.",
+)
+fs = st.sidebar.select_slider("Frecuencia de muestreo (Hz)", options=[2000, 5000, 10000, 20000, 50000], value=10000, key="fs")
+num_armonicos = st.sidebar.slider("Cantidad de armónicos", 1, 20, 3, key="num_arm")
+
+t_max = num_ciclos / f_base
 
 st.sidebar.markdown("---")
 preset = st.sidebar.selectbox(
     "Preset rápido",
     ["Personalizado", "Solo fundamental", "Rectificador (impares, decreciente)", "Distorsión típica motor VFD"],
+    key="preset_select",
 )
 
-t = np.linspace(0, t_max, int(fs * t_max), endpoint=False)
 
-# ------------------------------------------------------------------
-# Presets
-# ------------------------------------------------------------------
-def valores_preset(n_arm):
-    if preset == "Solo fundamental":
+def _aplicar_preset():
+    p = st.session_state["preset_select"]
+    n_arm = st.session_state["num_arm"]
+    if p == "Solo fundamental":
         mods = [1.0] + [0.0] * (n_arm - 1)
         fases = [0.0] * n_arm
-    elif preset == "Rectificador (impares, decreciente)":
-        mods = [1.0 if (i + 1) % 2 == 1 else 0.0 for i in range(n_arm)]
-        mods = [m / (i + 1) if m else 0.0 for i, m in enumerate(mods)]
+    elif p == "Rectificador (impares, decreciente)":
+        mods = [(1.0 / (i + 1)) if (i + 1) % 2 == 1 else 0.0 for i in range(n_arm)]
         fases = [0.0] * n_arm
-    elif preset == "Distorsión típica motor VFD":
+    elif p == "Distorsión típica motor VFD":
         base = {1: 1.0, 5: 0.25, 7: 0.15, 11: 0.08, 13: 0.06}
         mods = [base.get(i + 1, 0.0) for i in range(n_arm)]
         fases = [0.0] * n_arm
     else:
-        mods = None
-        fases = None
-    return mods, fases
+        return  # "Personalizado": no toca nada, deja los valores actuales
+    for i in range(n_arm):
+        st.session_state[f"mod_{i+1}"] = mods[i]
+        st.session_state[f"fase_{i+1}"] = fases[i]
 
-mods_preset, fases_preset = valores_preset(num_armonicos)
+
+st.sidebar.button("✅ Aplicar preset", on_click=_aplicar_preset, use_container_width=True)
+
+# Nyquist: la frecuencia del armónico más alto no puede superar fs/2
+f_max_pedido = f_base * num_armonicos
+if f_max_pedido >= fs / 2:
+    st.sidebar.warning(
+        f"⚠️ El armónico más alto pedido ({f_max_pedido} Hz) supera la frecuencia de "
+        f"Nyquist para esta frecuencia de muestreo ({fs/2:.0f} Hz). Subí `fs` o bajá la "
+        "cantidad de armónicos, o el espectro mostrado va a tener aliasing."
+    )
+
+t = np.linspace(0, t_max, int(fs * t_max), endpoint=False)
 
 # ------------------------------------------------------------------
 # Configuración de armónicos
@@ -64,10 +83,9 @@ for n in range(1, num_armonicos + 1):
     col = cols[(n - 1) % n_cols]
     with col:
         st.markdown(f"**Armónico {n}** ({n * f_base} Hz)")
-        default_mod = mods_preset[n - 1] if mods_preset else (1.0 if n == 1 else 0.0)
-        default_fase = fases_preset[n - 1] if fases_preset else 0.0
-        modulo = st.number_input("Módulo", value=float(default_mod), step=0.05, key=f"mod_{n}", min_value=0.0)
-        fase = st.number_input("Fase (°)", value=float(default_fase), step=5.0, key=f"fase_{n}")
+        default_mod = 1.0 if n == 1 else 0.0
+        modulo = st.number_input("Módulo", value=default_mod, step=0.05, key=f"mod_{n}", min_value=0.0)
+        fase = st.number_input("Fase (°)", value=0.0, step=5.0, key=f"fase_{n}")
     modulos.append(modulo)
     fases.append(np.deg2rad(fase))
 
@@ -138,6 +156,7 @@ if N > 0:
     fft_vals = np.fft.fft(senal_total)
     fft_freqs = np.fft.fftfreq(N, d=1 / fs)
     fft_mags = 2.0 / N * np.abs(fft_vals[: N // 2])
+    fft_mags[0] /= 2.0  # el bin de DC no se refleja, no lleva el factor 2 del resto
     fft_freqs = fft_freqs[: N // 2]
 
     f_max = f_base * (num_armonicos + 1)
