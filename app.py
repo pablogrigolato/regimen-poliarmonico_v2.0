@@ -39,7 +39,7 @@ t_max = num_ciclos / f_base
 st.sidebar.markdown("---")
 preset = st.sidebar.selectbox(
     "Preset rápido",
-    ["Personalizado", "Solo fundamental", "Rectificador (impares, decreciente)", "Distorsión típica motor VFD"],
+    ["Personalizado", "Solo fundamental", "Onda cuadrada (impares 1/n)", "Distorsión típica motor VFD"],
     key="preset_select",
 )
 
@@ -48,7 +48,7 @@ def _armonicos_default(p: str, n_arm: int):
     """Devuelve (mods, fases_deg) para un preset dado, sin tocar session_state."""
     if p == "Solo fundamental":
         mods = [1.0] + [0.0] * (n_arm - 1)
-    elif p == "Rectificador (impares, decreciente)":
+    elif p == "Onda cuadrada (impares 1/n)":
         mods = [(1.0 / (i + 1)) if (i + 1) % 2 == 1 else 0.0 for i in range(n_arm)]
     elif p == "Distorsión típica motor VFD":
         base = {1: 1.0, 5: 0.25, 7: 0.15, 11: 0.08, 13: 0.06}
@@ -79,14 +79,10 @@ def _aplicar_preset():
 
 st.sidebar.button("✅ Aplicar preset", on_click=_aplicar_preset, use_container_width=True)
 
-# Nyquist: la frecuencia del armónico más alto no puede superar fs/2
-f_max_pedido = f_base * num_armonicos
-if f_max_pedido >= fs / 2:
-    st.sidebar.warning(
-        f"⚠️ El armónico más alto pedido ({f_max_pedido} Hz) supera la frecuencia de "
-        f"Nyquist para esta frecuencia de muestreo ({fs/2:.0f} Hz). Subí `fs` o bajá la "
-        "cantidad de armónicos, o el espectro mostrado va a tener aliasing."
-    )
+# Nyquist: la frecuencia del armónico más alto CON AMPLITUD NO NULA no
+# puede superar fs/2. El chequeo real se hace más abajo (tras leer la
+# tabla); acá sólo se reserva el lugar en el sidebar.
+nyquist_ph = st.sidebar.empty()
 
 t = np.linspace(0, t_max, int(fs * t_max), endpoint=False)
 
@@ -143,6 +139,9 @@ edited_df = st.data_editor(
         "Fase (°)": st.column_config.NumberColumn(step=5.0, format="%.1f"),
     },
 )
+# Red de seguridad: si el usuario borra una celda queda NaN y se
+# propaga a toda la señal / THD / FFT. Se rellena con 0.
+edited_df[["Módulo", "Fase (°)"]] = edited_df[["Módulo", "Fase (°)"]].fillna(0.0)
 st.session_state["harm_df"] = edited_df
 
 modulos = edited_df["Módulo"].tolist()
@@ -152,11 +151,23 @@ fases = np.deg2rad(edited_df["Fase (°)"].to_numpy()).tolist()
 # Construcción de señales
 # ------------------------------------------------------------------
 frecuencias = [n * f_base for n in range(1, num_armonicos + 1)]
-armonicos_individuales = [
-    A * np.sin(2 * np.pi * f_n * t + phi)
-    for A, f_n, phi in zip(modulos, frecuencias, fases)
-]
-senal_total = np.sum(armonicos_individuales, axis=0) if armonicos_individuales else np.zeros_like(t)
+
+# La señal total se acumula en un solo array en vez de materializar los
+# (hasta 200) armónicos a la vez: mucho más liviano en memoria y CPU.
+senal_total = np.zeros_like(t)
+for A, f_n, phi in zip(modulos, frecuencias, fases):
+    if A != 0.0:
+        senal_total += A * np.sin(2 * np.pi * f_n * t + phi)
+
+# Chequeo de Nyquist sobre el armónico más alto realmente activo.
+armonicos_activos = [n for n, A in zip(range(1, num_armonicos + 1), modulos) if abs(A) > 1e-9]
+f_max_pedido = f_base * (max(armonicos_activos) if armonicos_activos else 1)
+if f_max_pedido >= fs / 2:
+    nyquist_ph.warning(
+        f"⚠️ El armónico activo más alto ({f_max_pedido:.0f} Hz) supera la frecuencia de "
+        f"Nyquist para esta frecuencia de muestreo ({fs/2:.0f} Hz). Subí `fs` o bajá el "
+        "armónico más alto, o el espectro mostrado va a tener aliasing."
+    )
 
 # ------------------------------------------------------------------
 # Métricas: RMS, THD
@@ -185,13 +196,26 @@ st.subheader("📈 Señal en el tiempo")
 
 fig1 = go.Figure()
 colores = ["#440154", "#414487", "#2a788e", "#22a884", "#7ad151", "#fde725"] * 4
-for i, armonico in enumerate(armonicos_individuales):
+
+# Sólo se trazan los armónicos con amplitud no nula, y hasta un tope,
+# para no saturar el navegador ni la leyenda. La señal total siempre
+# incluye a todos.
+MAX_TRAZAS = 15
+idx_activos = [i for i, A in enumerate(modulos) if abs(A) > 1e-9]
+idx_dibujar = idx_activos[:MAX_TRAZAS]
+for i in idx_dibujar:
+    armonico = modulos[i] * np.sin(2 * np.pi * frecuencias[i] * t + fases[i])
     fig1.add_trace(go.Scatter(
         x=t, y=armonico, mode="lines",
         line=dict(color=colores[i % len(colores)], dash="dot", width=1.3),
         name=f"Armónico {i+1} ({frecuencias[i]} Hz)",
         opacity=0.75,
     ))
+if len(idx_activos) > MAX_TRAZAS:
+    st.caption(
+        f"Se muestran los primeros {MAX_TRAZAS} de {len(idx_activos)} armónicos activos "
+        "como trazas individuales; la señal total (blanca) los incluye a todos."
+    )
 fig1.add_trace(go.Scatter(
     x=t, y=senal_total, mode="lines",
     line=dict(color="white", width=2.5),
@@ -213,7 +237,11 @@ st.subheader("🔍 Espectro de frecuencia (FFT)")
 N = len(senal_total)
 if N > 0:
     fft_vals = np.fft.fft(senal_total)
-    fft_freqs = np.fft.fftfreq(N, d=1 / fs)
+    # Paso de muestreo REAL (t_max/N). Como N = int(fs*t_max) trunca la
+    # fracción, usar 1/fs desalinea las etiquetas del eje cuando fs*t_max
+    # no es entero (los picos siguen on-bin, pero mal rotulados).
+    dt_real = (t[1] - t[0]) if N > 1 else 1 / fs
+    fft_freqs = np.fft.fftfreq(N, d=dt_real)
     fft_mags = 2.0 / N * np.abs(fft_vals[: N // 2])
     fft_mags[0] /= 2.0  # el bin de DC no se refleja, no lleva el factor 2 del resto
     fft_freqs = fft_freqs[: N // 2]
